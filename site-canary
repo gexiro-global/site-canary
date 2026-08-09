@@ -1,0 +1,230 @@
+#!/bin/sh
+# site-canary - off-host HTTP, content identity, cross-tenant leak, and latency checks.
+set -eu
+set -f
+
+PROGRAM=${0##*/}
+DEFAULT_CONFIG=./sites.conf
+DEFAULT_STATE=./site-canary.state
+CONFIG=${SITE_CANARY_CONFIG:-$DEFAULT_CONFIG}
+ALERT_ENV=${SITE_CANARY_ALERT_ENV:-}
+STATE_FILE=${SITE_CANARY_STATE_FILE:-$DEFAULT_STATE}
+DRY_RUN=0
+TEST_MODE=0
+TRANSPORT_TIMEOUT=${SITE_CANARY_TRANSPORT_TIMEOUT:-10}
+REQUEST_TIMEOUT=${SITE_CANARY_REQUEST_TIMEOUT:-30}
+
+usage() {
+  cat <<'EOF'
+Usage: site-canary [--config FILE] [--alert-env FILE] [--state FILE] [--dry-run] [--test]
+
+Exit codes: 0 healthy/test accepted, 1 usage or config error, 2 one or more sites failing.
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+trim() { printf '%s' "$1" | awk '{ sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print }'; }
+timestamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --config) [ "$#" -ge 2 ] || die '--config requires a file'; CONFIG=$2; shift 2 ;;
+    --alert-env) [ "$#" -ge 2 ] || die '--alert-env requires a file'; ALERT_ENV=$2; shift 2 ;;
+    --state) [ "$#" -ge 2 ] || die '--state requires a file'; STATE_FILE=$2; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --test) TEST_MODE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+if [ -n "$ALERT_ENV" ]; then
+  [ -r "$ALERT_ENV" ] || die "alert env file is not readable: $ALERT_ENV"
+  # The env file is trusted operator input and uses ordinary shell KEY=value syntax.
+  # shellcheck disable=SC1090
+  . "$ALERT_ENV"
+fi
+
+html_escape() {
+  printf '%s' "$1" | awk 'BEGIN { ORS="" } { if (NR > 1) printf "\n"; gsub(/&/, "\\&amp;"); gsub(/</, "\\&lt;"); gsub(/>/, "\\&gt;"); gsub(/\"/, "\\&quot;"); printf "%s", $0 }'
+}
+
+json_string() {
+  if command -v python3 >/dev/null 2>&1; then
+    JSON_INPUT=$1 python3 -c 'import json, os; print(json.dumps(os.environ["JSON_INPUT"]))'
+  else
+    printf '%s' "$1" | awk 'BEGIN { ORS=""; printf "\"" } { if (NR > 1) printf "\\n"; gsub(/\\/, "\\\\"); gsub(/\"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); printf "%s", $0 } END { print "\"" }'
+  fi
+}
+
+send_alert() {
+  alert_text=$1
+  delivered=0
+  printf '%s\n' "$alert_text"
+  if [ -n "${ALERT_WEBHOOK_URL:-}" ]; then
+    payload=$(json_string "$alert_text")
+    curl -fsS --max-time "$TRANSPORT_TIMEOUT" -H 'Content-Type: application/json' \
+      --data-binary "{\"text\":$payload}" "$ALERT_WEBHOOK_URL" >/dev/null 2>&1 || return 1
+    delivered=1
+  fi
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+    [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] || return 1
+    telegram_text=$(html_escape "$alert_text")
+    curl -fsS --max-time "$TRANSPORT_TIMEOUT" \
+      --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+      --data-urlencode "text=$telegram_text" \
+      --data-urlencode 'parse_mode=HTML' \
+      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || return 1
+    delivered=1
+  fi
+  # stdout is the transport of last resort.
+  [ "$delivered" -eq 1 ] || :
+}
+
+if [ "$TEST_MODE" -eq 1 ]; then
+  send_alert "SITE-CANARY TEST ($(timestamp)) — alert transport acceptance check" || die 'test alert delivery failed'
+  exit 0
+fi
+
+[ -r "$CONFIG" ] || die "config file is not readable: $CONFIG"
+case $REQUEST_TIMEOUT:$TRANSPORT_TIMEOUT in *[!0-9.:]*) die 'timeouts must be positive numbers' ;; esac
+awk -v request="$REQUEST_TIMEOUT" -v transport="$TRANSPORT_TIMEOUT" \
+  'BEGIN { exit !(request ~ /^[0-9]+([.][0-9]+)?$/ && request > 0 && transport ~ /^[0-9]+([.][0-9]+)?$/ && transport > 0) }' \
+  || die 'timeouts must be positive numbers'
+
+tmp_root=${TMPDIR:-/tmp}
+work_dir=$(mktemp -d "$tmp_root/site-canary.XXXXXX") || die 'could not create temporary directory'
+trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
+resolved=$work_dir/resolved
+: > "$resolved"
+line_no=0
+site_count=0
+
+while IFS= read -r raw || [ -n "$raw" ]; do
+  line_no=$((line_no + 1))
+  stripped=$(trim "$raw")
+  case $stripped in ''|'#'*) continue ;; esac
+  old_ifs=$IFS
+  IFS='|'
+  # shellcheck disable=SC2086
+  set -- $stripped
+  IFS=$old_ifs
+  url=$(trim "${1:-}")
+  [ -n "$url" ] || die "$CONFIG:$line_no: URL is required"
+  case $url in http://*|https://*) ;; *) die "$CONFIG:$line_no: URL must use http:// or https://" ;; esac
+  expect=200
+  marker=$(printf '%s' "$url" | sed 's,^[a-zA-Z][a-zA-Z0-9+.-]*://,,; s,/.*,,; s,:.*,,')
+  forbid=
+  max_rt=8
+  shift
+  for field do
+    field=$(trim "$field")
+    key=$(trim "${field%%=*}")
+    value=$(trim "${field#*=}")
+    [ "$field" != "$key" ] || die "$CONFIG:$line_no: expected key=value, got '$field'"
+    case $key in
+      expect) expect=$value ;;
+      marker) marker=$value ;;
+      forbid) forbid=$value ;;
+      max_rt) max_rt=$value ;;
+      *) die "$CONFIG:$line_no: unknown key '$key'" ;;
+    esac
+  done
+  case $expect in ''|*[!0-9]*) die "$CONFIG:$line_no: expect must be an HTTP status code" ;; esac
+  [ -n "$marker" ] || die "$CONFIG:$line_no: marker must not be empty"
+  if [ "$expect" -lt 100 ] 2>/dev/null || [ "$expect" -gt 599 ] 2>/dev/null; then
+    die "$CONFIG:$line_no: expect must be 100..599"
+  fi
+  case $max_rt in ''|*[!0-9.]*) die "$CONFIG:$line_no: max_rt must be a positive number" ;; esac
+  awk -v n="$max_rt" 'BEGIN { exit !(n ~ /^[0-9]+([.][0-9]+)?$/ && n > 0) }' || die "$CONFIG:$line_no: max_rt must be greater than zero"
+  printf '%s|%s|%s|%s|%s\n' "$url" "$expect" "$marker" "$forbid" "$max_rt" >> "$resolved"
+  site_count=$((site_count + 1))
+done < "$CONFIG"
+[ "$site_count" -gt 0 ] || die "$CONFIG defines no sites"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf 'SITE-CANARY: DRY-RUN — %s site(s) from %s\n' "$site_count" "$CONFIG"
+  awk -F '|' '{ printf "url=%s | expect=%s | marker=%s | forbid=%s | max_rt=%s\n", $1, $2, $3, ($4 == "" ? "(none)" : $4), $5 }' "$resolved"
+  exit 0
+fi
+
+ok=0
+failing=0
+failures=
+index=0
+tab=$(printf '\t')
+while IFS='|' read -r url expect marker forbid max_rt; do
+  index=$((index + 1))
+  body=$work_dir/body.$index
+  meta=$work_dir/meta.$index
+  curl_error=
+  if curl -sS -L --max-time "$REQUEST_TIMEOUT" -o "$body" -w '%{http_code}\t%{time_total}\n' "$url" > "$meta" 2>/dev/null; then
+    IFS="$tab" read -r actual_code actual_rt < "$meta"
+  else
+    actual_code=000
+    actual_rt=$REQUEST_TIMEOUT
+    curl_error='request failed'
+    : > "$body"
+  fi
+  reasons=
+  [ "$actual_code" = "$expect" ] || reasons="HTTP $actual_code (expected $expect)"
+  if [ -n "$marker" ] && ! grep -Fq -- "$marker" "$body"; then
+    reasons="${reasons}${reasons:+; }required marker missing"
+  fi
+  if [ -n "$forbid" ]; then
+    old_ifs=$IFS
+    IFS=','
+    # shellcheck disable=SC2086
+    set -- $forbid
+    IFS=$old_ifs
+    for forbidden do
+      forbidden=$(trim "$forbidden")
+      [ -n "$forbidden" ] || continue
+      if grep -Fq -- "$forbidden" "$body"; then
+        reasons="${reasons}${reasons:+; }CROSS-TENANT LEAK: forbidden marker present '$forbidden'"
+      fi
+    done
+  fi
+  if ! awk -v got="$actual_rt" -v max="$max_rt" 'BEGIN { exit !(got <= max) }'; then
+    reasons="${reasons}${reasons:+; }latency ${actual_rt}s exceeds ${max_rt}s"
+  fi
+  [ -z "$curl_error" ] || reasons="${reasons}${reasons:+; }$curl_error"
+  if [ -z "$reasons" ]; then
+    ok=$((ok + 1))
+  else
+    failing=$((failing + 1))
+    if [ -n "$failures" ]; then
+      failures="$failures
+- $url: $reasons"
+    else
+      failures="- $url: $reasons"
+    fi
+  fi
+done < "$resolved"
+
+ts=$(timestamp)
+previous=UNKNOWN
+[ -r "$STATE_FILE" ] && previous=$(sed -n '1p' "$STATE_FILE")
+state_dir=${STATE_FILE%/*}
+[ "$state_dir" = "$STATE_FILE" ] && state_dir=.
+[ -d "$state_dir" ] || die "state directory does not exist: $state_dir"
+state_tmp=$work_dir/state
+
+if [ "$failing" -gt 0 ]; then
+  printf 'FAIL\n' > "$state_tmp"
+  mv "$state_tmp" "$STATE_FILE" || die "could not write state file: $STATE_FILE"
+  if [ "$previous" != FAIL ]; then
+    send_alert "SITE-CANARY ALERT ($ts) — $ok ok, $failing failing
+$failures" || printf '%s: alert delivery failed\n' "$PROGRAM" >&2
+  fi
+  printf 'SITE-CANARY: FAIL (%s) — %s ok, %s failing\n' "$ts" "$ok" "$failing"
+  exit 2
+fi
+
+printf 'PASS\n' > "$state_tmp"
+mv "$state_tmp" "$STATE_FILE" || die "could not write state file: $STATE_FILE"
+if [ "$previous" = FAIL ]; then
+  send_alert "SITE-CANARY RECOVERED ($ts) — all $ok site(s) healthy" || printf '%s: recovery alert delivery failed\n' "$PROGRAM" >&2
+fi
+printf 'SITE-CANARY: PASS (%s) — %s ok, 0 failing\n' "$ts" "$ok"
+exit 0

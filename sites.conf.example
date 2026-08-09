@@ -1,0 +1,3 @@
+# One site per line. Only the URL is required.
+# URL | expect=HTTP_CODE | marker=required literal | forbid=literal,another | max_rt=seconds
+https://example.com/ | expect=200 | marker=Example Domain | forbid=other-site.example,staging | max_rt=8
