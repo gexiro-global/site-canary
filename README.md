@@ -28,13 +28,13 @@ Copy the example and edit it:
 cp sites.conf.example sites.conf
 ```
 
-The format is one pipe-separated site per line. Blank lines and lines whose first non-space character is `#` are ignored.
+The format is one pipe-separated site per line. Blank lines and lines whose first non-space character is `#` are ignored. Escape a literal pipe in a value as `\|`; equals signs need no escaping. CRLF files are accepted. Duplicate scalar keys use the last value, while repeated `forbid` keys are accumulated. Unknown keys are errors.
 
 ```text
 https://example.com/ | expect=200 | marker=Example Domain | forbid=other-site.example,staging | max_rt=8
 ```
 
-Only `url` is required. Defaults are `expect=200`, `marker=<URL hostname>`, no forbidden markers, and `max_rt=8` seconds. Values are literal; pipe characters cannot appear within a value. URLs must use HTTP or HTTPS. Redirects are followed and the status check applies to the final response.
+Only `url` is required. Defaults are `expect=200`, `marker=<URL hostname>`, no forbidden markers, and `max_rt=8` seconds. An explicitly empty marker is an error. Expected statuses must be 2xx: transport errors and non-2xx responses always fail closed. URLs must use HTTP or HTTPS. Redirects are followed and the status check applies to the final response.
 
 Select the file with `--config FILE` or `SITE_CANARY_CONFIG`. State defaults to `./site-canary.state`; use `--state FILE` or `SITE_CANARY_STATE_FILE` when running from cron.
 
