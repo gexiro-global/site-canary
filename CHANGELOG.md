@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- No unreleased changes.
+
+## [0.1.1] - 2026-08-10
+
 - Standardize the canonical test runner on an explicit Bash shebang and direct execution.
 - Fail closed on request transport errors, empty/missing response metadata, non-2xx status, content failures, and invalid/excessive latency.
 - Make marker checks literal and case-sensitive; accumulate comma-separated and repeated `forbid` values and reject explicitly empty markers.
