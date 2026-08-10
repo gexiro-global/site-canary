@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Standardize the canonical test runner on an explicit Bash shebang and direct execution.
 - Fail closed on request transport errors, empty/missing response metadata, non-2xx status, content failures, and invalid/excessive latency.
 - Make marker checks literal and case-sensitive; accumulate comma-separated and repeated `forbid` values and reject explicitly empty markers.
 - Harden configuration parsing for whitespace, CRLF, escaped pipes, equals signs, duplicates, and unknown keys.
