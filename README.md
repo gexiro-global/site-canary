@@ -7,7 +7,7 @@ A dependency-light, config-driven external synthetic monitor for checking multip
 
 `site-canary` checks the expected HTTP status, a required content marker, forbidden cross-tenant markers, and response latency. It is designed to run off-host from a separate node, where it exercises public DNS, TLS, routing, and application delivery together.
 
-Requirements: POSIX `sh`, `curl`, `awk`, `grep`, and standard Unix utilities. `python3` is optional and is used when available for webhook JSON escaping; a built-in encoder is used otherwise.
+Requirements: POSIX `sh`, `curl`, `awk`, `grep`, and standard Unix utilities. Webhook JSON escaping uses the built-in dependency-free encoder.
 
 ## The cross-tenant leak check
 
